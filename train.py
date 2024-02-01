@@ -22,7 +22,7 @@ filename = "data/LC50_Bluegill_unknown_4.csv"
 def train_model(filename: str) -> nn.Module:
     df = pd.read_csv(filename)
     molecules = [Chem.MolFromSmiles(s) for s in df["smiles"]]
-    targets = df["value"].tolist()
+    targets = torch.tensor(df["value"].tolist(), dtype=torch.float32)
 
     X_full = [list(AllChem.GetMorganFingerprintAsBitVect(molecule, radius=2)) for molecule in
               tqdm(molecules, desc="Calculating descriptors")]
@@ -55,7 +55,7 @@ def train_model(filename: str) -> nn.Module:
 
             y_pred = model(x)
 
-            loss = loss_function(y_pred.view(*y_true.shape), y_true).to(torch.float32)
+            loss = loss_function(y_pred.view(*y_true.shape), y_true)
             epoch_train_losses.append(loss.item())
 
             loss.backward()
@@ -75,7 +75,6 @@ def train_model(filename: str) -> nn.Module:
 model, r2, train_losses, test_losses = train_model(filename)
 
 # TODO: save R2 to file (txt, json, ...)
-print("R2 =", r2_score(y_test, test_pred))
 with open("filename.json", "r") as file:
     r2s = json.load(file)
 r2s[filename] = r2
