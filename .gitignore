@@ -1,3 +1,4 @@
-# created by virtualenv automatically
-.venv/Lib
 data
+venv
+.idea/
+*/.idea/
