@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import torch
+import json
 from matplotlib import pyplot as plt
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -10,7 +11,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from model import FeedForward
+from Model import FeedForward
 
 num_in_features = 2048
 num_out_features = 1
@@ -75,14 +76,19 @@ def train_model(filename: str) -> nn.Module:
 model, r2, train_losses, test_losses = train_model(filename)
 
 # TODO: save R2 to file (txt, json, ...)
-with open("filename.json", "r") as file:
-    r2s = json.load(file)
-r2s[filename] = r2
-with open("filename.json", "w") as file:
-    json.dump(r2s, file)
+# with open("r2_score.json", "r") as file:
+#     r2s = json.load(file)
+# r2s[filename] = r2
+# with open("r2_score.json", "w") as file:
+#     json.dump(r2s, file)
 
-plt.plot(train_losses, label="train loss")
-plt.plot(test_losses, label="test loss")
+
+
 # TODO: save plot as image
+plt.plot(train_losses, label="train loss")
+plt.savefig('train_loss.png')
+plt.plot(test_losses, label="test loss")
+plt.savefig('test_loss.png')
 
 # TODO: save model to .pth
+torch.save(model.state_dict(), )

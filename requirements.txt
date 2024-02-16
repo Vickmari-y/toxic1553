@@ -8,3 +8,4 @@ rdkit
 pandas
 tqdm
 pyarrow
+optuna
