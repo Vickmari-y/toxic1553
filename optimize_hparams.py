@@ -1,23 +1,39 @@
+import mlflow
 import optuna
 import pandas as pd
+import random
 import torch
 from deepchem.feat import RDKitDescriptors, CircularFingerprint
 from rdkit import Chem
+from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.optim import Adam, AdamW, SGD, RMSprop
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
 
 from Model import FeedForward
-from utils import ConcatFeaturizer
+from utils import ConcatFeaturizer, EarlyStopping
 
-filename = "data/LC50_Bluegill_unknown_4.csv"
-max_epoch = 5
-n_trials = 3
-timeout = None
+MLFLOW_TRACKING_URI = "http://127.0.0.1:8891"
+max_epoch = 100
+reduce_lr_patianse = 8
+reduce_lr_factor = 0.2
+reduce_lr_cooldown = 2
+es_patience = 10
+n_trials = None
+timeout = 3600 * 24
+device = torch.device("cuda:0")
+seed = 27
 
+filenames = [
+    "data/LD50_mouse_intravenous_30.csv",
+    # "data/LD50_rat_intraperitoneal_30.csv",
+    # "data/LD50_rat_intravenous_30.csv",
+    # "data/LD50_rabbit_oral_30.csv",
+    # "data/LD50_rabbit_skin_30.csv",
+    # "data/LD50_rat_subcutaneous_30.csv",
+]
 featurizer_variants = {
     "ConcatFeaturizer_small": ConcatFeaturizer(featurizers=[
         RDKitDescriptors(),
@@ -43,10 +59,16 @@ optimizer_variants = {
     'SGD': SGD,
     'RMSprop': RMSprop,
 }
+CASHED_DATA = {
+    name: {
+        featurizer: None
+        for featurizer in featurizer_variants.keys()
+    } for name in filenames
+}
 
 
 def estimate_params(trial):
-    n_layers = trial.suggest_int("n_layers", 1, 8)
+    n_layers = trial.suggest_int("n_layers", 2, 5)
     act_func_name = trial.suggest_categorical("activation", act_func_variants.keys())
     return {
         "dims": [
@@ -58,48 +80,96 @@ def estimate_params(trial):
 
 
 def load_data(filename, featurizer, batch_size=16, test_size=0.1, val_size=0.1):
-    df = pd.read_csv(filename)
-    molecules = [Chem.MolFromSmiles(s) for s in df["smiles"]]
-    targets = torch.tensor(df["value"].tolist(), dtype=torch.float32)
+    try:
+        X_full, targets = CASHED_DATA[filename][featurizer]
+    except KeyError:
+        df = pd.read_csv(filename)
+        molecules = [Chem.MolFromSmiles(s) for s in df["smiles"]]
+        targets = torch.tensor(df["value"].tolist(), dtype=torch.float32)
 
-    X_full = featurizer.featurize(molecules)
-    X_full = torch.from_numpy(X_full).to(torch.float32)
-    x_train_val, x_test, y_train_val, y_test = train_test_split(X_full, targets, test_size=test_size, random_state=42)
-    x_train, x_val, y_train, y_val = train_test_split(x_train_val, y_train_val, test_size=val_size, random_state=42)
+        X_full = featurizer.featurize(molecules)
+        X_full = torch.from_numpy(X_full).to(torch.float32)
 
-    train_dataloader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size)
-    test_dataloader = DataLoader(TensorDataset(x_test, y_test), batch_size=batch_size)
-    val_dataloader = DataLoader(TensorDataset(x_val, y_val), batch_size=batch_size)
+        CASHED_DATA[filename][featurizer] = (X_full, targets)
+
+    x_train_val, x_test, y_train_val, y_test = train_test_split(X_full, targets, test_size=test_size, random_state=seed)
+    x_train, x_val, y_train, y_val = train_test_split(x_train_val, y_train_val, test_size=val_size, random_state=seed)
+    mean, std = y_train.mean(), y_train.std()
+
+    y_train = (y_train - mean) / std
+    y_val = (y_val - mean) / std
+    y_test = (y_test - mean) / std
+
+    train_dataloader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(TensorDataset(x_val, y_val), batch_size=batch_size, shuffle=True)
 
     return train_dataloader, val_dataloader, test_dataloader
 
 
-def train_model(model, optimizer, loss_function, train_dataloader, val_dataloader, test_dataloader):
-    scheduler = ReduceLROnPlateau(optimizer, patience=30, factor=0.1)
-    for epoch in tqdm(range(max_epoch), desc="Training progress", total=max_epoch):
+def train_model(trial, model, optimizer, loss_function, train_dataloader, val_dataloader, test_dataloader):
+    def get_loss(model, dataloader):
+        with torch.no_grad():
+            predictions = torch.cat([model(x.to(device)).cpu() for x, y in dataloader], dim=0)
+        true = torch.cat([y for x, y in dataloader], dim=0)
+        loss = loss_function(predictions, true)
+        return loss
+
+    def get_r2(model, dataloader):
+        with torch.no_grad():
+            predictions = torch.cat([model(x.to(device)).cpu() for x, y in dataloader], dim=0)
+        true = torch.cat([y for x, y in dataloader], dim=0)
+        r2 = r2_score(true.numpy(), predictions.numpy())
+        return r2
+
+    def train_one_batch(model, batch, step=0):
+        x, y_true = batch
+        optimizer.zero_grad()
+        y_pred = model(x.to(device))
+        loss = loss_function(y_pred.view(*y_true.shape), y_true.to(device))
+        loss.backward()
+        optimizer.step()
+
+        val_loss = get_loss(model, val_dataloader)
+
+        mlflow.log_metrics({"train_loss": loss.item(), "val_loss": val_loss.item()}, step=step)
+        mlflow.log_metric("lr", optimizer.param_groups[0]["lr"], step=step)
+
+        trial.report(val_loss.item(), step=step)
+        if trial.should_prune():
+            raise optuna.exceptions.TrialPruned()
+
+        return model, loss, val_loss
+
+    model.train()
+    model.to(device)
+    scheduler = ReduceLROnPlateau(optimizer, patience=reduce_lr_patianse, factor=reduce_lr_factor, cooldown=reduce_lr_cooldown)
+    es_scheduler = EarlyStopping(patience=es_patience, path="output/checkpoint.pt")
+    for epoch in range(max_epoch):
         for i, batch in enumerate(train_dataloader):
-            x, y_true = batch
-            optimizer.zero_grad()
-            y_pred = model(x)
-            loss = loss_function(y_pred.view(*y_true.shape), y_true)
-            loss.backward()
-            optimizer.step()
+            model, train_loss, val_loss = train_one_batch(model, batch, step=epoch * len(train_dataloader) + i)
+            print(f"\rEpoch {epoch + 1}/{max_epoch}, batch {i + 1}/{len(train_dataloader)}: "
+                  f"train_loss = {train_loss:.4f}, val_loss = {val_loss:.4f}", end="")
 
-            val_predictions = torch.cat([model(x) for x, y in val_dataloader], dim=0)
-            val_true = torch.cat([y for x, y in val_dataloader], dim=0)
-            val_loss = loss_function(val_predictions, val_true)
+        val_loss = get_loss(model, val_dataloader)
+        scheduler.step(val_loss)
+        es_scheduler(val_loss, model)
+        if es_scheduler.early_stop:
+            break
 
-            scheduler.step(val_loss)
+    mlflow.log_metrics({
+        "train_r2": get_r2(model, train_dataloader),
+        "val_r2": get_r2(model, val_dataloader),
+        "test_r2": get_r2(model, test_dataloader)
+    })
 
-    test_predictions = torch.cat([model(x) for x, y in test_dataloader], dim=0)
-    test_true = torch.cat([y for x, y in test_dataloader], dim=0)
-    test_loss = loss_function(test_predictions, test_true)
-
-    return test_loss.item()
+    val_loss = get_loss(model, val_dataloader)
+    return val_loss.item()
 
 
 def objective(trial):
     featurizer_name = trial.suggest_categorical("featurizer", featurizer_variants.keys())
+    filename = random.choice(filenames)
     train_dataloader, val_dataloader, test_dataloader = load_data(
         filename,
         featurizer=featurizer_variants[featurizer_name],
@@ -111,9 +181,15 @@ def objective(trial):
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-1, log=True)
     optimizer_name = trial.suggest_categorical("optimizer", optimizer_variants.keys())
     optimizer = optimizer_variants[optimizer_name](model.parameters(), lr=learning_rate)
-
     loss_function = nn.MSELoss()
-    final_test_loss = train_model(model, optimizer, loss_function, train_dataloader, val_dataloader, test_dataloader)
+
+    with mlflow.start_run(run_name=f"trial_{trial.number}"):
+        mlflow.log_params(trial.params)
+        mlflow.set_tags({"trial": trial.number, "datetime_start": trial.datetime_start})
+        mlflow.log_input(mlflow.data.from_pandas(pd.read_csv(filename), source=filename), context="total_data")
+
+        final_test_loss = train_model(trial, model, optimizer, loss_function, train_dataloader, val_dataloader,
+                                      test_dataloader)
 
     return final_test_loss
 
@@ -122,7 +198,9 @@ study = optuna.create_study(
     study_name="optimize_hparams",
     storage="sqlite:///output/optimize_hparams.db",
     load_if_exists=True,
-    direction="minimize"
+    direction="minimize",
+    pruner=optuna.pruners.ThresholdPruner(n_warmup_steps=100, upper=1e7)
 )
 
+mlflow.set_experiment(experiment_name="optimize_hparams")
 study.optimize(objective, n_trials=n_trials, timeout=timeout)
