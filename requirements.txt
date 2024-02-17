@@ -9,3 +9,4 @@ pandas
 tqdm
 pyarrow
 optuna
+deepchem
