@@ -1,8 +1,10 @@
-from deepchem.feat import MolecularFeaturizer
 import numpy as np
+import pandas as pd
 import torch
 from deepchem.feat import MolecularFeaturizer
 from rdkit import Chem
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 
 
 class ConcatFeaturizer(MolecularFeaturizer):
@@ -16,41 +18,26 @@ class ConcatFeaturizer(MolecularFeaturizer):
         return np.concatenate([f._featurize(mol, **kwargs) for f in self.featurizers], axis=-1)
 
 
-class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
+def load_data(filename, featurizer, batch_size=16, test_size=0.1, val_size=0.1, max_samples=None, seed=27, normalize=False):
+    df = pd.read_csv(filename, nrows=max_samples)
+    molecules = [Chem.MolFromSmiles(s) for s in df["smiles"]]
+    targets = torch.tensor(df["value"].tolist(), dtype=torch.float32).view(-1, 1)
 
-    def __init__(self, patience=7, verbose=False, delta=0, path='checkpoint.pt', trace_func=print):
-        """
-        Args:
-            patience (int): How long to wait after last time validation loss improved.
-                            Default: 7
-            verbose (bool): If True, prints a message for each validation loss improvement.
-                            Default: False
-            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
-                            Default: 0
-            path (str): Path for the checkpoint to be saved to.
-                            Default: 'checkpoint.pt'
-            trace_func (function): trace print function.
-                            Default: print
-        """
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-        self.delta = delta
-        self.path = path
-        self.trace_func = trace_func
+    X_full = featurizer.featurize(molecules)
+    X_full = torch.from_numpy(X_full).to(torch.float32)
 
-    def __call__(self, val_loss, model):
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss + self.delta:
-            self.counter += 1
-            self.trace_func(f'\nEarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
+    x_train_val, x_test, y_train_val, y_test = train_test_split(X_full, targets, test_size=test_size, random_state=seed)
+    x_train, x_val, y_train, y_val = train_test_split(x_train_val, y_train_val, test_size=val_size, random_state=seed)
 
+    if normalize:
+        mean, std = y_train.mean(), y_train.std()
+
+        y_train = (y_train - mean) / std
+        y_val = (y_val - mean) / std
+        y_test = (y_test - mean) / std
+
+    train_dataloader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True, drop_last=True)
+    test_dataloader = DataLoader(TensorDataset(x_test, y_test), batch_size=batch_size, drop_last=True)
+    val_dataloader = DataLoader(TensorDataset(x_val, y_val), batch_size=batch_size, drop_last=True)
+
+    return train_dataloader, val_dataloader, test_dataloader

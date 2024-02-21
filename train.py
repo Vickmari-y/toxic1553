@@ -1,94 +1,128 @@
-import numpy as np
+import mlflow
 import pandas as pd
 import torch
-import json
-from matplotlib import pyplot as plt
+from deepchem.feat import RDKitDescriptors, CircularFingerprint
 from rdkit import Chem
-from rdkit.Chem import AllChem
 from sklearn.metrics import r2_score
 from sklearn.model_selection import train_test_split
 from torch import nn
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from torch.nn import PReLU
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader, TensorDataset
 
 from Model import FeedForward
+from utils import ConcatFeaturizer, EarlyStopping
 
-num_in_features = 2048
-num_out_features = 1
-learning_rate = 1e-4
-max_epoch = 30
-filename = "data/LC50_Bluegill_unknown_4.csv"
+max_epoch = 100
+reduce_lr_patianse = 8
+reduce_lr_factor = 0.2
+reduce_lr_cooldown = 2
+es_patience = 10
+device = torch.device("cuda:0")
+seed = 27
 
 
-def train_model(filename: str) -> nn.Module:
+def load_data(filename, featurizer, batch_size=16, test_size=0.1, val_size=0.1):
     df = pd.read_csv(filename)
     molecules = [Chem.MolFromSmiles(s) for s in df["smiles"]]
     targets = torch.tensor(df["value"].tolist(), dtype=torch.float32)
 
-    X_full = [list(AllChem.GetMorganFingerprintAsBitVect(molecule, radius=2)) for molecule in
-              tqdm(molecules, desc="Calculating descriptors")]
+    X_full = featurizer.featurize(molecules)
+    X_full = torch.from_numpy(X_full).to(torch.float32)
 
-    X_full = torch.tensor(X_full, dtype=torch.float32)
+    x_train_val, x_test, y_train_val, y_test = train_test_split(X_full, targets, test_size=test_size, random_state=seed)
+    x_train, x_val, y_train, y_val = train_test_split(x_train_val, y_train_val, test_size=val_size, random_state=seed)
+    mean, std = y_train.mean(), y_train.std()
 
-    x_train, x_test, y_train, y_test = train_test_split(X_full, targets, test_size=0.1, random_state=42)
+    y_train = (y_train - mean) / std
+    y_val = (y_val - mean) / std
+    y_test = (y_test - mean) / std
 
-    train_data = list(zip(x_train, y_train))
-    train_dataloader = DataLoader(train_data, batch_size=16)
-    test_data = list(zip(x_test, y_test))
+    train_dataloader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
+    test_dataloader = DataLoader(TensorDataset(x_test, y_test), batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(TensorDataset(x_val, y_val), batch_size=batch_size, shuffle=True)
 
-    model = FeedForward(num_in_features, num_out_features)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    loss_function = nn.MSELoss()
+    return train_dataloader, val_dataloader, test_dataloader
 
-    train_losses = []
-    test_losses = []
 
-    for epoch in tqdm(range(max_epoch), desc="Training progress", total=max_epoch):
-        test_predictions = torch.tensor([model(x).item() for x, y in test_data])
-        test_loss = loss_function(test_predictions, torch.tensor(y_test))
-        test_losses.append(test_loss)
+def train_model(model, optimizer, loss_function, train_dataloader, val_dataloader, test_dataloader):
+    def get_loss(model, dataloader):
+        with torch.no_grad():
+            predictions = torch.cat([model(x.to(device)).cpu() for x, y in dataloader], dim=0)
+        true = torch.cat([y for x, y in dataloader], dim=0)
+        loss = loss_function(predictions, true)
+        return loss
 
-        epoch_train_losses = []
-        for batch in train_dataloader:
-            x, y_true = batch
+    def get_r2(model, dataloader):
+        with torch.no_grad():
+            predictions = torch.cat([model(x.to(device)).cpu() for x, y in dataloader], dim=0)
+        true = torch.cat([y for x, y in dataloader], dim=0)
+        r2 = r2_score(true.numpy(), predictions.numpy())
+        return r2
 
-            optimizer.zero_grad()
-
-            y_pred = model(x)
-
-            loss = loss_function(y_pred.view(*y_true.shape), y_true)
-            epoch_train_losses.append(loss.item())
-
-            loss.backward()
-            optimizer.step()
-        train_losses.append(np.mean(epoch_train_losses))
-
-    test_pred = []
-    for batch in test_data:
+    def train_one_batch(model, batch, step=0):
         x, y_true = batch
-        y_pred = model(x)
-        test_pred.append(y_pred.item())
-    r2 = r2_score(y_test, test_pred)
+        optimizer.zero_grad()
+        y_pred = model(x.to(device))
+        loss = loss_function(y_pred.view(*y_true.shape), y_true.to(device))
+        loss.backward()
+        optimizer.step()
 
-    return model, r2, train_losses, test_losses
+        val_loss = get_loss(model, val_dataloader)
+
+        mlflow.log_metrics({"train_loss": loss.item(), "val_loss": val_loss.item()}, step=step)
+        mlflow.log_metric("lr", optimizer.param_groups[0]["lr"], step=step)
+
+        return model, loss, val_loss
+
+    model.train()
+    model.to(device)
+    scheduler = ReduceLROnPlateau(optimizer, patience=reduce_lr_patianse, factor=reduce_lr_factor,
+                                  cooldown=reduce_lr_cooldown)
+    es_scheduler = EarlyStopping(patience=es_patience)
+    for epoch in range(max_epoch):
+        for i, batch in enumerate(train_dataloader):
+            model, train_loss, val_loss = train_one_batch(model, batch, step=epoch * len(train_dataloader) + i)
+            print(f"\rEpoch {epoch + 1}/{max_epoch}, batch {i + 1}/{len(train_dataloader)}: "
+                  f"train_loss = {train_loss:.4f}, val_loss = {val_loss:.4f}", end="")
+
+        val_loss = get_loss(model, val_dataloader)
+        scheduler.step(val_loss)
+        es_scheduler(val_loss)
+        if es_scheduler.early_stop:
+            break
+
+    mlflow.log_metrics({
+        "train_r2": get_r2(model, train_dataloader),
+        "val_r2": get_r2(model, val_dataloader),
+        "test_r2": get_r2(model, test_dataloader)
+    })
+
+    val_loss = get_loss(model, val_dataloader)
+    return val_loss.item()
 
 
-model, r2, train_losses, test_losses = train_model(filename)
+train_dataloader, val_dataloader, test_dataloader = load_data(
+    "data/LD50_mouse_intravenous_30.csv",
+    featurizer=ConcatFeaturizer(featurizers=[
+        RDKitDescriptors(),
+        CircularFingerprint(radius=2, size=512),
+        CircularFingerprint(radius=3, size=512),
+    ]),
+    batch_size=32,
+    test_size=0.1
+)
+model = FeedForward(
+    dims=(96, 96, 288, 416, 480, 224, 480),
+    act_func=PReLU(num_parameters=1),
+    num_in_features=next(iter(test_dataloader))[0].shape[-1],
+    num_out_features=1
+)
 
-# TODO: save R2 to file (txt, json, ...)
-# with open("r2_score.json", "r") as file:
-#     r2s = json.load(file)
-# r2s[filename] = r2
-# with open("r2_score.json", "w") as file:
-#     json.dump(r2s, file)
+optimizer = Adam(model.parameters(), lr=1e-2)
+loss_function = nn.MSELoss()
 
-
-
-# TODO: save plot as image
-plt.plot(train_losses, label="train loss")
-plt.savefig('train_loss.png')
-plt.plot(test_losses, label="test loss")
-plt.savefig('test_loss.png')
-
-# TODO: save model to .pth
-torch.save(model.state_dict(), )
+with mlflow.start_run(run_name=f"digital-pharma-params"):
+    train_model(model, optimizer, loss_function, train_dataloader, val_dataloader,
+                test_dataloader)
