@@ -8,7 +8,7 @@ from pytorch_lightning.callbacks import EarlyStopping
 from torch import nn
 from torch.optim import Adam, AdamW, SGD, RMSprop
 
-from Model import FeedForward
+from model import FeedForward
 from utils import ConcatFeaturizer, load_data
 
 # MLFLOW_TRACKING_URI = "http://127.0.0.1:8891"
@@ -111,7 +111,6 @@ study = optuna.create_study(
     storage=f"sqlite:///output/{experiment_name}.db",
     load_if_exists=True,
     direction="minimize",
-    pruner=optuna.pruners.ThresholdPruner(n_warmup_steps=100, upper=1e3)
 )
 
 mlflow.set_experiment(experiment_name=experiment_name)
