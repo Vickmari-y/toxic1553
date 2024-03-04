@@ -3,7 +3,6 @@ import torch
 from pytorch_lightning import LightningModule
 from sklearn.metrics import r2_score
 from torch import nn
-from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
@@ -48,7 +47,8 @@ class FeedForward(LightningModule):
     def training_step(self, batch):
         inputs, target = batch
         output = self.forward(inputs)
-        loss = self.loss_function(output, target.view(*output.shape))
+        mask = ~target.isnan()
+        loss = self.loss_function(output[mask], target[mask])
         self.log('train_loss', loss, batch_size=target.shape[0], prog_bar=True)
         mlflow.log_metric("train_loss", loss, step=self.global_step)
         self.train_step_outputs += [output]
@@ -58,7 +58,8 @@ class FeedForward(LightningModule):
     def validation_step(self, batch):
         inputs, target = batch
         output = self.forward(inputs)
-        loss = self.loss_function(output, target.view(*output.shape))
+        mask = ~target.isnan()
+        loss = self.loss_function(output[mask], target[mask])
         self.log('val_loss', loss, batch_size=target.shape[0])
         # mlflow.log_metric("val_loss", loss, step=self.global_step)
         self.val_step_outputs += [output]
@@ -68,8 +69,9 @@ class FeedForward(LightningModule):
     def on_validation_epoch_end(self):
         predictions = torch.cat(self.val_step_outputs, dim=0)
         true = torch.cat(self.val_step_true, dim=0)
+        mask = ~true.isnan()
 
-        r2 = r2_score(true.detach().cpu().numpy(), predictions.detach().cpu().numpy())
+        r2 = r2_score(true[mask].detach().cpu().numpy(), predictions[mask].detach().cpu().numpy())
         loss = self.loss_function(predictions, true)
         mlflow.log_metrics({"val_loss": loss.item(), "val_r2": r2}, step=self.current_epoch)
         self.val_step_outputs = []
@@ -78,8 +80,9 @@ class FeedForward(LightningModule):
     def on_train_epoch_end(self):
         predictions = torch.cat(self.train_step_outputs, dim=0)
         true = torch.cat(self.train_step_true, dim=0)
+        mask = ~true.isnan()
 
-        r2 = r2_score(true.detach().cpu().numpy(), predictions.detach().cpu().numpy())
+        r2 = r2_score(true[mask].detach().cpu().numpy(), predictions[mask].detach().cpu().numpy())
         loss = self.loss_function(predictions, true)
         mlflow.log_metrics({
             "train_loss": loss.item(),

@@ -1,6 +1,5 @@
 import mlflow
 import optuna
-import pandas as pd
 import torch
 from deepchem.feat import CircularFingerprint
 from pytorch_lightning import Trainer
@@ -9,36 +8,54 @@ from torch import nn
 from torch.optim import Adam, AdamW, SGD, RMSprop
 
 from model import FeedForward
-from utils import ConcatFeaturizer, load_data
+from utils import ConcatFeaturizer, create_dataloaders
 
-# MLFLOW_TRACKING_URI = "http://127.0.0.1:8891"
-experiment_name = "optimize_hparams_lightning_2"
+experiment_name = "optimize_hparams"
 
-max_epochs = 200
-es_patience = 20
-reduce_lr_patience = 10
+max_epochs = 300
+es_patience = 30
+reduce_lr_patience = 15
 reduce_lr_factor = 0.2
 reduce_lr_cooldown = 2
 
 seed = 27
-n_trials = None
-timeout = 3600 * 24 * 5
+n_trials = 300
+timeout = None
 device = torch.device("cuda:0")
 max_samples = None
+batch_size = 8
 
-filename = "data/log_data/log_LD50_rat_intravenous_30.csv"
+filename = "data/LD50_train_multi.csv"
+targets = [
+    'LD50_guinea pig_oral_30',
+    'LD50_guinea pig_intravenous_30',
+    'LD50_guinea pig_subcutaneous_30',
+    'LD50_guinea pig_skin_30',
+    'LD50_rabbit_oral_30',
+    'LD50_rabbit_intravenous_30',
+    'LD50_rabbit_subcutaneous_30',
+    'LD50_rabbit_skin_30',
+    'LD50_mouse_oral_30',
+    'LD50_mouse_intravenous_30',
+    'LD50_mouse_subcutaneous_30',
+    'LD50_mouse_skin_30',
+    'LD50_rat_oral_30',
+    'LD50_rat_intravenous_30',
+    'LD50_rat_subcutaneous_30',
+    'LD50_rat_skin_30',
+]
 
 featurizer_variants = {
     "ConcatFeaturizer_small": ConcatFeaturizer(featurizers=[
         CircularFingerprint(radius=2, size=512),
         CircularFingerprint(radius=3, size=512),
     ]),
+    "CircularFingerprint_2_2048": CircularFingerprint(radius=2, size=2048),
+    "CircularFingerprint_3_2048": CircularFingerprint(radius=3, size=2048),
     "ConcatFeaturizer_large": ConcatFeaturizer(featurizers=[
         CircularFingerprint(radius=2, size=2048),
         CircularFingerprint(radius=3, size=2048),
     ]),
-    "CircularFingerprint_2_2048": CircularFingerprint(radius=2, size=2048),
-    "CircularFingerprint_3_2048": CircularFingerprint(radius=3, size=2048),
 }
 act_func_variants = {
     "nn.LeakyReLU()": nn.LeakyReLU(),
@@ -79,20 +96,26 @@ def estimate_params(trial):
 
 def objective(trial):
     featurizer_name = trial.suggest_categorical("featurizer", featurizer_variants.keys())
-    train_dataloader, val_dataloader, test_dataloader = load_data(
+    train_dataloader, val_dataloader = create_dataloaders(
         filename,
         featurizer=featurizer_variants[featurizer_name],
-        batch_size=trial.suggest_int("batch_size", 8, 128, log=True),
-        test_size=0.1,
+        batch_size=batch_size,
         val_size=0.1,
-        seed=seed,
+        targets=targets,
         max_samples=max_samples,
     )
+    # test_datasets = {
+    #     target: load_data(
+    #         f"data/test_data/log_{target}.csv",
+    #         targets=[target],
+    #         featurizer=featurizer_variants[featurizer_name],
+    #     ) for target in targets
+    # }
 
     model = FeedForward(
         **estimate_params(trial),
-        num_in_features=next(iter(test_dataloader))[0].shape[-1],
-        num_out_features=1,
+        num_in_features=next(iter(train_dataloader))[0].shape[-1],
+        num_out_features=len(targets),
         loss_function=nn.MSELoss(),
     )
 
@@ -100,8 +123,16 @@ def objective(trial):
     trainer = Trainer(accelerator="auto", callbacks=[es_callback], max_epochs=max_epochs)
     with mlflow.start_run(run_name=f"trial_{trial.number}"):
         mlflow.log_params(trial.params)
-        mlflow.log_input(mlflow.data.from_pandas(pd.read_csv(filename), source=filename), context="total_data")
+        # mlflow.log_input(mlflow.data.from_pandas(pd.read_csv(filename), source=filename), context="total_data")
         trainer.fit(model, train_dataloader, val_dataloader)
+        # mlflow.log_metric("val_loss", trainer.callback_metrics["val_loss"].item())
+
+        # for target in targets:
+        #     x_test, y_test = test_datasets[target]
+        #     model.eva()
+        #     with model.no_grad():
+        #         predictions = model(x_test)
+        #     mlflow.log_metric(f"r2_test_{target}", r2_score(y_test, predictions))
 
     return trainer.callback_metrics["val_loss"].item()
 
