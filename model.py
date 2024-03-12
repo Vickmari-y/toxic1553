@@ -7,7 +7,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 class FeedForward(LightningModule):
-    def __init__(self, num_in_features, num_out_features, act_func, dims,
+    def __init__(self, num_in_features, num_out_features, act_func, dims, dropouts,
                  loss_function, optimizer, scheduler_kwargs, optimizer_kwargs):
         super().__init__()
         self.loss_function = loss_function
@@ -16,6 +16,7 @@ class FeedForward(LightningModule):
         self.optimizer_kwargs = optimizer_kwargs
         self.act_func = act_func
         self.hidden_dims = (num_in_features,) + dims
+        self.dropouts = dropouts
 
         self.seq = self.make_fc_blocks()
         self.out_seq = nn.Linear(self.hidden_dims[-1], num_out_features)
@@ -26,15 +27,16 @@ class FeedForward(LightningModule):
         self.val_step_true = []
 
     def make_fc_blocks(self):
-        def fc_layer(in_f, out_f):
+        def fc_layer(in_f, out_f, dropout):
             return nn.Sequential(
                 nn.Linear(in_f, out_f),
                 nn.BatchNorm1d(out_f),
+                nn.Dropout(dropout),
                 self.act_func
             )
 
         lin_layers = [
-            fc_layer(self.hidden_dims[i], self.hidden_dims[i + 1])
+            fc_layer(self.hidden_dims[i], self.hidden_dims[i + 1], self.dropouts[i])
             for i in range(len(self.hidden_dims) - 1)
         ]
         return nn.Sequential(*lin_layers)
@@ -50,7 +52,6 @@ class FeedForward(LightningModule):
         mask = ~target.isnan()
         loss = self.loss_function(output[mask], target[mask])
         self.log('train_loss', loss, batch_size=target.shape[0], prog_bar=True)
-        mlflow.log_metric("train_loss", loss, step=self.global_step)
         self.train_step_outputs += [output]
         self.train_step_true += [target.view(*output.shape)]
         return loss
@@ -61,7 +62,6 @@ class FeedForward(LightningModule):
         mask = ~target.isnan()
         loss = self.loss_function(output[mask], target[mask])
         self.log('val_loss', loss, batch_size=target.shape[0])
-        # mlflow.log_metric("val_loss", loss, step=self.global_step)
         self.val_step_outputs += [output]
         self.val_step_true += [target.view(*output.shape)]
         return loss
@@ -72,8 +72,8 @@ class FeedForward(LightningModule):
         mask = ~true.isnan()
 
         r2 = r2_score(true[mask].detach().cpu().numpy(), predictions[mask].detach().cpu().numpy())
-        loss = self.loss_function(predictions, true)
-        mlflow.log_metrics({"val_loss": loss.item(), "val_r2": r2}, step=self.current_epoch)
+        loss = self.loss_function(predictions[mask], true[mask])
+        mlflow.log_metrics({"loss_val": loss.item(), "r2_val": r2}, step=self.current_epoch)
         self.val_step_outputs = []
         self.val_step_true = []
 
@@ -83,10 +83,10 @@ class FeedForward(LightningModule):
         mask = ~true.isnan()
 
         r2 = r2_score(true[mask].detach().cpu().numpy(), predictions[mask].detach().cpu().numpy())
-        loss = self.loss_function(predictions, true)
+        loss = self.loss_function(predictions[mask], true[mask])
         mlflow.log_metrics({
-            "train_loss": loss.item(),
-            "train_r2": r2,
+            "loss_train": loss.item(),
+            "r2_train": r2,
             "lr": self.optimizers().param_groups[0]["lr"]
         }, step=self.current_epoch)
         self.train_step_outputs = []

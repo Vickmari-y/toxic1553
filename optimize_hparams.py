@@ -1,5 +1,6 @@
 import mlflow
 import optuna
+import pandas as pd
 import torch
 from deepchem.feat import CircularFingerprint
 from pytorch_lightning import Trainer
@@ -8,13 +9,13 @@ from torch import nn
 from torch.optim import Adam, AdamW, SGD, RMSprop
 
 from model import FeedForward
-from utils import ConcatFeaturizer, create_dataloaders
+from utils import ConcatFeaturizer, create_dataloaders, EstateFeaturizer, TableFeaturizer
 
-experiment_name = "optimize_hparams"
+experiment_name = "optimize_hparams_mouse"
 
 max_epochs = 300
-es_patience = 30
-reduce_lr_patience = 15
+es_patience = 80
+reduce_lr_patience = 30
 reduce_lr_factor = 0.2
 reduce_lr_cooldown = 2
 
@@ -23,39 +24,24 @@ n_trials = 300
 timeout = None
 device = torch.device("cuda:0")
 max_samples = None
-batch_size = 8
+batch_size = 16
 
 filename = "data/LD50_train_multi.csv"
 targets = [
-    'LD50_guinea pig_oral_30',
-    'LD50_guinea pig_intravenous_30',
-    'LD50_guinea pig_subcutaneous_30',
-    'LD50_guinea pig_skin_30',
-    'LD50_rabbit_oral_30',
-    'LD50_rabbit_intravenous_30',
-    'LD50_rabbit_subcutaneous_30',
-    'LD50_rabbit_skin_30',
     'LD50_mouse_oral_30',
     'LD50_mouse_intravenous_30',
     'LD50_mouse_subcutaneous_30',
     'LD50_mouse_skin_30',
-    'LD50_rat_oral_30',
-    'LD50_rat_intravenous_30',
-    'LD50_rat_subcutaneous_30',
-    'LD50_rat_skin_30',
 ]
 
 featurizer_variants = {
-    "ConcatFeaturizer_small": ConcatFeaturizer(featurizers=[
-        CircularFingerprint(radius=2, size=512),
-        CircularFingerprint(radius=3, size=512),
-    ]),
-    "CircularFingerprint_2_2048": CircularFingerprint(radius=2, size=2048),
-    "CircularFingerprint_3_2048": CircularFingerprint(radius=3, size=2048),
-    "ConcatFeaturizer_large": ConcatFeaturizer(featurizers=[
+    "Circular_2_3_2048": ConcatFeaturizer(featurizers=[
         CircularFingerprint(radius=2, size=2048),
         CircularFingerprint(radius=3, size=2048),
     ]),
+    "Estate_logP_logS": ConcatFeaturizer(featurizers=[
+        TableFeaturizer(df=pd.read_csv("data/features.csv")),
+        EstateFeaturizer(), ])
 }
 act_func_variants = {
     "nn.LeakyReLU()": nn.LeakyReLU(),
@@ -75,13 +61,16 @@ optimizer_variants = {
 
 
 def estimate_params(trial):
-    n_layers = trial.suggest_int("n_layers", 2, 7)
+    n_layers = trial.suggest_int("n_layers", 4, 7)
     act_func_name = trial.suggest_categorical("activation", act_func_variants.keys())
     optimizer_name = trial.suggest_categorical("optimizer", optimizer_variants.keys())
     return {
         "dims": tuple(
-            trial.suggest_int(f"dim_{i}", 32, 2048, log=True)
+            trial.suggest_int(f"dim_{i}", 64, 2048, log=True)
             for i in range(n_layers)
+        ),
+        "dropouts": tuple(
+            trial.suggest_float(f"dropout_{i}", 0.0, 0.5) for i in range(n_layers)
         ),
         "act_func": act_func_variants[act_func_name],
         "scheduler_kwargs": {
