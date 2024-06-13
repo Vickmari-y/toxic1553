@@ -2,7 +2,6 @@ import os
 
 import mlflow
 import numpy as np
-import pandas as pd
 import torch
 from deepchem.feat import CircularFingerprint
 from matplotlib import pyplot as plt
@@ -11,10 +10,11 @@ from pytorch_lightning.callbacks import EarlyStopping
 from sklearn.metrics import mean_absolute_error, r2_score
 from torch import nn
 from torch.nn import MSELoss
-from torch.optim import Adam
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, TensorDataset
 
 from model import FeedForward
-from utils import ConcatFeaturizer, create_dataloaders, TableFeaturizer
+from utils import ConcatFeaturizer, create_dataloaders, load_data
 
 experiment_name = "mouse_multitarget"
 max_epochs = 1000
@@ -23,7 +23,7 @@ reduce_lr_factor = 0.2
 reduce_lr_cooldown = 2
 es_patience = 100
 device = torch.device("cuda:0")
-seed = 27
+seed = 1553
 max_samples = None
 
 learning_rate = 1e-2
@@ -47,7 +47,8 @@ def report_metrics(model, loaders: dict):
             current_true = true[:, i]
             current_pred = pred[:, i]
             mask = ~current_true.isnan()
-            mlflow.log_metric(f"RMSE_{name}_{target}", np.sqrt(MSELoss()(current_pred[mask], current_true[mask]).item()))
+            mlflow.log_metric(f"RMSE_{name}_{target}",
+                              np.sqrt(MSELoss()(current_pred[mask], current_true[mask]).item()))
             mlflow.log_metric(f"MAE_{name}_{target}", mean_absolute_error(current_true[mask], current_pred[mask]))
             mlflow.log_metric(f"R2_{name}_{target}", r2_score(current_true[mask], current_pred[mask]))
 
@@ -81,16 +82,14 @@ targets = [
     # 'LD50_rat_skin_30',
 ]
 
-activation = nn.ReLU()
-optimizer = Adam
-dims = (2048, 1024, 512, 256, 128, 64)
-dropouts = (0.5, 0.5, 0.5, 0.5, 0.25, 0.1)
-featurizer = ConcatFeaturizer([
-    CircularFingerprint(radius=2, size=1024),
-    CircularFingerprint(radius=3, size=1024),
-    # TableFeaturizer(df=pd.read_csv("data/features.csv")),
-    # EstateFeaturizer(),
+featurizer = ConcatFeaturizer(featurizers=[
+    CircularFingerprint(radius=2, size=2048),
+    CircularFingerprint(radius=3, size=2048),
 ])
+activation = nn.PReLU()
+optimizer = AdamW
+dims = (455, 700, 359, 253, 338)
+dropouts = (0.3705148571109272, 0.3866904393383811, 0.09555730388487488, 0.23477937500282223, 0.2321243257281017)
 
 train_dataloader, val_dataloader = create_dataloaders(
     filename,
@@ -123,10 +122,23 @@ model = FeedForward(
 loss_function = nn.MSELoss()
 
 mlflow.set_experiment(experiment_name=experiment_name)
-with mlflow.start_run():
+with mlflow.start_run(run_name=f"seed = {seed}"):
     # report_metrics(model, {"train-before-train": train_dataloader, "val-before-train": val_dataloader})
-    es_callback = EarlyStopping(patience=es_patience, monitor="val_loss")
-    trainer = Trainer(accelerator="auto", callbacks=[es_callback], max_epochs=max_epochs)
-    trainer.fit(model, train_dataloader, val_dataloader)
-    mlflow.pytorch.log_state_dict(model.state_dict(), artifact_path="model_state_dict")
-    report_metrics(model, {"train": train_dataloader, "val": val_dataloader})
+    # es_callback = EarlyStopping(patience=es_patience, monitor="val_loss")
+    # trainer = Trainer(accelerator="auto", callbacks=[es_callback], max_epochs=max_epochs)
+    # trainer.fit(model, train_dataloader, val_dataloader)
+    # mlflow.pytorch.log_state_dict(model.state_dict(), artifact_path="model_state_dict")
+    model_path = "mlruns/747621466262265458/a2060dfcbadf4626baa0efd25f360ceb/artifacts/model_state_dict/state_dict.pth"
+    model.load_state_dict(torch.load(model_path))
+
+    test_X = []
+    test_y = []
+    for target in targets:
+        X, y = load_data(filename=f"data/test_data/log_{target}.csv", targets=[target], featurizer=featurizer)
+        new_y = torch.full((X.shape[0], len(targets)), float("nan"))
+        new_y[:, targets.index(target)] = y.squeeze()
+        test_X += [X]
+        test_y += [new_y]
+    test_dataloader = DataLoader(TensorDataset(torch.cat(test_X), torch.cat(test_y)), batch_size=1)
+
+    report_metrics(model, {"train": train_dataloader, "val": val_dataloader, "test": test_dataloader})
